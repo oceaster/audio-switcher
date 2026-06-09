@@ -1,0 +1,340 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly APP_NAME="audio-switcher"
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/audio-switcher"
+readonly CONFIG_FILE="$CONFIG_DIR/config"
+readonly LOCK_FILE="$CONFIG_DIR/lock"
+readonly POLL_INTERVAL=0.1
+readonly POLL_TIMEOUT=30
+
+# ── Messaging ──────────────────────────────────────────────
+
+die() { printf "ERROR: %s\n" "$*" >&2; exit 1; }
+
+info() { printf "%s\n" "$*" >&2; }
+
+notify() {
+    local title="$1" body="$2"
+    if command -v notify-send &>/dev/null; then
+        notify-send --urgency=low "$title" "$body" --icon=audio-speakers 2>/dev/null || true
+    fi
+    info "$title: $body"
+}
+
+# ── Pre-flight ─────────────────────────────────────────────
+
+check_prereqs() {
+    command -v pactl &>/dev/null || die "pactl not found — install PipeWire/PulseAudio"
+    pactl info &>/dev/null || die "Cannot reach PipeWire/PulseAudio — is the server running?"
+}
+
+# ── Locking ────────────────────────────────────────────────
+
+acquire_lock() {
+    mkdir -p "$CONFIG_DIR"
+    exec {_LOCK_FD}>"$LOCK_FILE"
+    if ! flock -n "$_LOCK_FD"; then
+        die "Another $APP_NAME instance is already running"
+    fi
+    # _LOCK_FD stays open for the lifetime of this script
+}
+
+# ── Sink helpers ───────────────────────────────────────────
+
+get_all_sinks() {
+    pactl list short sinks | awk '{print $NF}'
+}
+
+get_sink_description() {
+    local sink="$1"
+    pactl list sinks \
+        | awk -v target="$sink" '
+            $1 == "Name:" && $2 == target { found = 1 }
+            found && $1 == "Description:" { sub(/^[[:space:]]*Description:[[:space:]]*/, ""); print; exit }
+        '
+}
+
+get_default_sink() {
+    pactl get-default-sink
+}
+
+# ── Pattern resolution ─────────────────────────────────────
+#   exact name  → literal match against pactl sink names
+#   @substring  → case-insensitive substring match against
+#                  both the sink name and its description
+
+resolve_sink() {
+    local pattern="$1"
+
+    if [[ "$pattern" == @* ]]; then
+        local substr="${pattern#@}"
+        local sink desc
+        while IFS= read -r sink; do
+            desc=$(get_sink_description "$sink")
+            if echo "${sink} ${desc}" | grep -qiF "$substr"; then
+                printf '%s\n' "$sink"
+                return 0
+            fi
+        done < <(get_all_sinks)
+        return 1
+    fi
+
+    # Exact match
+    if get_all_sinks | grep -qFx "$pattern"; then
+        printf '%s\n' "$pattern"
+        return 0
+    fi
+    return 1
+}
+
+# ── Config ─────────────────────────────────────────────────
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$CONFIG_FILE"
+    fi
+}
+
+save_config() {
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' "$@" > "$CONFIG_FILE"
+}
+
+get_configured_sinks() {
+    local resolved=()
+    while IFS= read -r pattern; do
+        local sink
+        if sink=$(resolve_sink "$pattern"); then
+            resolved+=("$sink")
+        fi
+    done < <(load_config)
+
+    if [[ ${#resolved[@]} -eq 0 ]]; then
+        return 1
+    fi
+    printf '%s\n' "${resolved[@]}"
+}
+
+# ── Apply switch ───────────────────────────────────────────
+
+switch_to() {
+    local sink="$1"
+    local desc
+    desc=$(get_sink_description "$sink")
+
+    # Set default sink
+    if ! pactl set-default-sink "$sink"; then
+        die "Failed to set default sink"
+    fi
+
+    # Wait for PipeWire to register the default change
+    local waited=0
+    while ! get_default_sink | grep -qFx "$sink"; do
+        sleep "$POLL_INTERVAL"
+        waited=$(echo "$waited + $POLL_INTERVAL" | bc)
+        if (( $(echo "$waited >= $POLL_TIMEOUT" | bc -l) )); then
+            info "Warning: default sink did not confirm within ${POLL_TIMEOUT}s"
+            break
+        fi
+    done
+
+    # Move all playback streams to the new sink
+    local inputs
+    inputs=$(pactl list short sink-inputs | awk '{print $1}')
+    for input in $inputs; do
+        pactl move-sink-input "$input" "$sink" 2>/dev/null || true
+    done
+
+    # Unmute and set a reasonable volume if muted
+    pactl set-sink-mute "$sink" 0 2>/dev/null || true
+
+    notify "Audio Switcher" "$desc"
+}
+
+# ── Setup wizard ───────────────────────────────────────────
+
+setup_wizard() {
+    echo "══════════════════════════════════════════════"
+    echo "      Audio Switcher — Device Setup"
+    echo "══════════════════════════════════════════════"
+    echo ""
+
+    local all_sinks sink_names=() descriptions=()
+    all_sinks=$(get_all_sinks)
+    local i=1 default_sink
+    default_sink=$(get_default_sink)
+
+    while IFS= read -r sink; do
+        local desc marker=" "
+        desc=$(get_sink_description "$sink")
+        [[ "$sink" == "$default_sink" ]] && marker="→"
+
+        printf " %2d) %s %s\n" "$i" "$marker" "$desc"
+        sink_names+=("$sink")
+        descriptions+=("$desc")
+        ((i++))
+    done < <(get_all_sinks)
+
+    if [[ ${#sink_names[@]} -eq 0 ]]; then
+        die "No audio sinks detected"
+    fi
+
+    if [[ ${#sink_names[@]} -eq 1 ]]; then
+        echo ""
+        info "Only one device found — configuring it as the sole output."
+        save_config "@${descriptions[0]}"
+        return
+    fi
+
+    echo ""
+    echo "Pick the devices to cycle through when toggling."
+    echo "Enter numbers separated by spaces, in desired order."
+    echo "Example: 2 1 3"
+    echo ""
+
+    local selection chosen=()
+    read -rp "Selection: " selection
+
+    for num in $selection; do
+        if [[ "$num" =~ ^[0-9]+$ ]] && (( num >= 1 && num <= ${#sink_names[@]} )); then
+            # Store as @description pattern for portability
+            chosen+=("@${descriptions[$((num-1))]}")
+        fi
+    done
+
+    if [[ ${#chosen[@]} -eq 0 ]]; then
+        die "No valid devices selected"
+    fi
+
+    save_config "${chosen[@]}"
+    echo ""
+    info "Saved. Run '$APP_NAME' to toggle between:"
+    for c in "${chosen[@]}"; do printf '  → %s\n' "${c#@}"; done
+}
+
+# ── Commands ───────────────────────────────────────────────
+
+cmd_list() {
+    local current
+    current=$(get_default_sink)
+
+    local sink desc marker
+    while IFS= read -r sink; do
+        marker=" "
+        [[ "$sink" == "$current" ]] && marker="→"
+
+        desc=$(get_sink_description "$sink")
+        printf " %s %s  (%s)\n" "$marker" "$desc" "$sink"
+    done < <(get_all_sinks)
+}
+
+cmd_toggle() {
+    local sinks=() sink
+    if ! get_configured_sinks &>/dev/null; then
+        setup_wizard
+    fi
+
+    while IFS= read -r sink; do
+        sinks+=("$sink")
+    done < <(get_configured_sinks)
+
+    if [[ ${#sinks[@]} -eq 0 ]]; then
+        die "No configured sinks are currently available — run '$APP_NAME --config'"
+    fi
+
+    # If only one configured sink, just switch to it
+    if [[ ${#sinks[@]} -eq 1 ]]; then
+        switch_to "${sinks[0]}"
+        return
+    fi
+
+    local current idx=-1
+    current=$(get_default_sink)
+
+    for i in "${!sinks[@]}"; do
+        if [[ "${sinks[$i]}" == "$current" ]]; then
+            idx=$i
+            break
+        fi
+    done
+
+    local next
+    if (( idx < 0 )); then
+        next="${sinks[0]}"
+    else
+        next="${sinks[$(( (idx + 1) % ${#sinks[@]} ))]}"
+    fi
+
+    switch_to "$next"
+}
+
+cmd_menu() {
+    local sink_names=() i=1
+    local current
+    current=$(get_default_sink)
+
+    echo "Select audio output:"
+    echo ""
+
+    while IFS= read -r sink; do
+        local marker=" "
+        local desc
+        desc=$(get_sink_description "$sink")
+        [[ "$sink" == "$current" ]] && marker="→"
+        printf "  %2d) %s %s\n" "$i" "$marker" "$desc"
+        sink_names+=("$sink")
+        ((i++))
+    done < <(get_all_sinks)
+
+    if [[ ${#sink_names[@]} -eq 0 ]]; then
+        die "No audio sinks available"
+    fi
+
+    echo ""
+    read -rp "Choice (1-${#sink_names[@]}): " choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#sink_names[@]} )); then
+        switch_to "${sink_names[$((choice-1))]}"
+    else
+        die "Invalid selection"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Usage: $APP_NAME [OPTION]
+
+Toggle between audio output sinks. Stores preferences in
+  $CONFIG_FILE
+
+Options:
+  (none)       Toggle to the next configured audio output
+  -l, --list   List all available sinks
+  -m, --menu   Interactive menu to pick an output
+  -c, --config Run the device setup wizard
+  -h, --help   Show this help
+
+First run (no config present) automatically launches setup.
+EOF
+}
+
+# ── Main ───────────────────────────────────────────────────
+
+main() {
+    acquire_lock
+    check_prereqs
+
+    case "${1:-}" in
+        -l|--list)   cmd_list ;;
+        -m|--menu)   cmd_menu ;;
+        -c|--config) setup_wizard ;;
+        -h|--help)   cmd_help ;;
+        "")          cmd_toggle ;;
+        *)
+            die "Unknown option '$1'. Use --help for usage."
+            ;;
+    esac
+}
+
+main "$@"
